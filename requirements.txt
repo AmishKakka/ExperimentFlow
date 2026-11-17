@@ -6,3 +6,4 @@ opencv-python
 PyYAML
 google-genai
 pydantic
+python-dotenv
