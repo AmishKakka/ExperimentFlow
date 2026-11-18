@@ -6,3 +6,4 @@ temp_data.parquet
 *.parquet
 venv/
 .DS_Store
+mlruns/

@@ -7,3 +7,4 @@ PyYAML
 google-genai
 pydantic
 python-dotenv
+mlflow

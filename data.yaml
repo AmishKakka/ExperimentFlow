@@ -1,4 +1,6 @@
 data:
+  # Required. Initial planner prompt. Leave blank to use the default query:
+  user_initial_query: "i want to perform some clustering on this dataset, see how i can do it?"
   # Declare your data source --> ["parquet", "api", "csv", "excel"]
   source_type: "api"
   # The api to request data from if using "api" data source
