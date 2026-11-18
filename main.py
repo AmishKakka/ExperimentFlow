@@ -2,10 +2,10 @@ import json
 from pprint import pprint
 import polars as pl
 import numpy as np
-from data_ingestion import load_yaml_file, get_data_info
+from data_ingestion import load_yaml_file, get_data_info, resolve_user_initial_query
 from data_analysis import get_analysis, get_concrete_plan, Analysis, InitialAnalysis
-from data_pipeline import transformation_pipeline, build_sklearn_column_transformer
-from validator import validate_and_fix_plan
+from data_pipeline import transformation_pipeline
+from experiment_tracking import configure_mlflow, execute_model
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     r2_score,
@@ -51,20 +51,22 @@ CLUSTERER_MAP = {
 
 def main():
     # Data ingestion and schema configuration
-    df, schema = load_yaml_file(filepath="data.yaml")
+    df, schema, data_config = load_yaml_file(filepath="data.yaml")
     df_schema = get_data_info(df)
 
-    # User's high-level intent query
     print("\n" + "=" * 65)
     print("LLM-POWERED MLOPS PIPELINE: ")
     print("=" * 65)
-    user_initial_query = input(
-        "\n[Step 1] What kind of training or output would you like to achieve with this dataset?\n"
-        "(e.g., 'predict fare amount', 'classify high vs low tip', or 'explore options'): "
-    ).strip()
-
-    if not user_initial_query:
-        user_initial_query = "Analyze the dataset, find suitable targets, and recommend the best ML task."
+    query = data_config.get("user_initial_query") if isinstance(data_config, dict) else None
+    user_initial_query = resolve_user_initial_query(data_config)
+    if not isinstance(query, str) or not query.strip():
+        print(
+            "\n[Step 1] 'user_initial_query' is missing or empty in data.yaml. "
+            "Using the default query."
+        )
+    else:
+        print("\n[Step 1] Using user_initial_query from data.yaml.")
+    print(user_initial_query)
 
     # Initial assessment
     initial_analysis: InitialAnalysis = get_analysis(
@@ -134,6 +136,23 @@ def main():
 
     # Model Training & Evaluation based on Task Type
     task_type = concrete_plan.task_type
+    test_size = schema.get("test_split", 0.2)
+    random_state = 42
+    configure_mlflow()
+    shared_config = {
+        "user_initial_query": user_initial_query,
+        "user_final_query": user_final_query,
+        "task_type": task_type,
+        "target_column": target_col,
+        "test_size": test_size,
+        "random_state": random_state,
+        "transformations": [
+            step.model_dump() if hasattr(step, "model_dump") else step
+            for step in (concrete_plan.transformations or [])
+        ],
+        "validator_corrections": list(validation_report.corrections),
+        "validator_warnings": list(validation_report.warnings),
+    }
 
     if task_type == "regression":
         if not target_col or target_col not in df_transformed.columns:
@@ -141,8 +160,9 @@ def main():
 
         X = df_transformed.drop(target_col)
         y = df_transformed[target_col]
-        test_size = schema.get("test_split", 0.2)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state
+        )
 
         print("\nTraining Suggested Regression Models...")
         suggested = concrete_plan.suggested_regression_models or []
@@ -154,22 +174,31 @@ def main():
                 Regressor(model_name="RandomForestRegressor", hyperparameters={"n_estimators": 50, "max_depth": 10})
             ]
 
+        def fit_regression(model):
+            model.fit(X_train, y_train)
+            preds = model.predict(X_test)
+            return {
+                "r2": float(r2_score(y_test, preds)),
+                "mae": float(mean_absolute_error(y_test, preds)),
+            }
+
         for model_info in suggested:
             m_name = model_info.model_name
             m_cls = REGRESSOR_MAP.get(m_name)
             if not m_cls:
                 print(f"Model '{m_name}' not recognized in REGRESSOR_MAP. Skipping.")
                 continue
-
-            try:
-                model = m_cls(**model_info.hyperparameters)
-                model.fit(X_train, y_train)
-                preds = model.predict(X_test)
-                r2 = r2_score(y_test, preds)
-                mae = mean_absolute_error(y_test, preds)
-                print(f"  ✅ {m_name} | R² Score: {r2:7.4f} | MAE: {mae:7.4f}")
-            except Exception as e:
-                print(f"  ❌ Error training {m_name}: {e}")
+            execute_model(
+                model_name=m_name,
+                model_cls=m_cls,
+                hyperparameters=model_info.hyperparameters,
+                shared_config=shared_config,
+                fit_and_score=fit_regression,
+                format_success=lambda metrics, name=m_name: (
+                    f"  ✅ {name} | R² Score: {metrics['r2']:7.4f} | MAE: {metrics['mae']:7.4f}"
+                ),
+                input_frame=X_train,
+            )
 
     elif task_type == "classification":
         if not target_col or target_col not in df_transformed.columns:
@@ -177,8 +206,9 @@ def main():
 
         X = df_transformed.drop(target_col)
         y = df_transformed[target_col]
-        test_size = schema.get("test_split", 0.2)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state
+        )
 
         print("\nTraining Suggested Classification Models...")
         suggested = concrete_plan.suggested_classification_models or []
@@ -189,27 +219,38 @@ def main():
                 Classifier(model_name="RandomForestClassifier", hyperparameters={"n_estimators": 50})
             ]
 
+        def fit_classification(model):
+            model.fit(X_train, y_train)
+            preds = model.predict(X_test)
+            return {
+                "accuracy": float(accuracy_score(y_test, preds)),
+                "f1_weighted": float(f1_score(y_test, preds, average="weighted")),
+            }
+
         for model_info in suggested:
             m_name = model_info.model_name
             m_cls = CLASSIFIER_MAP.get(m_name)
             if not m_cls:
                 print(f"Model '{m_name}' not recognized in CLASSIFIER_MAP. Skipping.")
                 continue
-
-            try:
-                model = m_cls(**model_info.hyperparameters)
-                model.fit(X_train, y_train)
-                preds = model.predict(X_test)
-                acc = accuracy_score(y_test, preds)
-                f1 = f1_score(y_test, preds, average="weighted")
-                print(f"  ✅ {m_name} | Accuracy: {acc:7.4f} | F1 (weighted): {f1:7.4f}")
-            except Exception as e:
-                print(f"  ❌ Error training {m_name}: {e}")
+            execute_model(
+                model_name=m_name,
+                model_cls=m_cls,
+                hyperparameters=model_info.hyperparameters,
+                shared_config=shared_config,
+                fit_and_score=fit_classification,
+                format_success=lambda metrics, name=m_name: (
+                    f"  ✅ {name} | Accuracy: {metrics['accuracy']:7.4f} | "
+                    f"F1 (weighted): {metrics['f1_weighted']:7.4f}"
+                ),
+                input_frame=X_train,
+            )
 
     elif task_type == "clustering":
         X = df_transformed
         if target_col and target_col in X.columns:
             X = X.drop(target_col)
+        X_mat = X.to_numpy()
 
         print("\nTraining Suggested Clustering Models...")
         suggested = concrete_plan.suggested_clustering_models or []
@@ -217,27 +258,36 @@ def main():
             from data_analysis import Clusterer
             suggested = [Clusterer(model_name="KMeans", hyperparameters={"n_clusters": 3, "random_state": 42})]
 
+        def fit_clustering(model):
+            labels = model.fit_predict(X_mat)
+            unique_labels = set(labels) - {-1}
+            metrics = {"n_clusters": int(len(unique_labels))}
+            if len(unique_labels) > 1:
+                metrics["silhouette"] = float(silhouette_score(X_mat, labels)) # pyright: ignore[reportArgumentType]
+            return metrics
+
         for model_info in suggested:
             m_name = model_info.model_name
             m_cls = CLUSTERER_MAP.get(m_name)
             if not m_cls:
                 print(f"Model '{m_name}' not recognized in CLUSTERER_MAP. Skipping.")
                 continue
-
-            try:
-                model = m_cls(**model_info.hyperparameters)
-                X_mat = X.to_numpy()
-                labels = model.fit_predict(X_mat)
-                unique_labels = set(labels) - {-1}
-                if len(unique_labels) > 1:
-                    score = silhouette_score(X_mat, labels)
-                    print(f"  ✅ {m_name} | Silhouette Score: {score:7.4f} | Clusters: {len(unique_labels)}")
-                else:
-                    print(f"  ✅ {m_name} | Fit completed (Clusters formed: {len(unique_labels)})")
-            except Exception as e:
-                print(f"  ❌ Error training {m_name}: {e}")
-
+            execute_model(
+                model_name=m_name,
+                model_cls=m_cls,
+                hyperparameters=model_info.hyperparameters,
+                shared_config=shared_config,
+                fit_and_score=fit_clustering,
+                format_success=lambda metrics, name=m_name: (
+                    f"  ✅ {name} | Silhouette Score: {metrics['silhouette']:7.4f} | "
+                    f"Clusters: {int(metrics['n_clusters'])}"
+                    if "silhouette" in metrics
+                    else f"  ✅ {name} | Fit completed (Clusters formed: {int(metrics['n_clusters'])})"
+                ),
+                input_frame=X_mat,
+            )
     print("\nPipeline execution successfully finished!")
+    print("Each model run, its configuration, and the fitted model is in ./mlruns (mlflow.db and artifacts/).")
 
 
 if __name__ == "__main__":
