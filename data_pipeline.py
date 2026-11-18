@@ -131,7 +131,7 @@ def transformation_pipeline(
     else:
         # Convert sparse matrix or raw array to a dense 2D NumPy array
         if hasattr(transformed_output, "toarray"):
-            np_data = transformed_output.toarray()
+            np_data = transformed_output.toarray() # pyright: ignore[reportAttributeAccessIssue]
         else:
             np_data = np.asarray(transformed_output)
 

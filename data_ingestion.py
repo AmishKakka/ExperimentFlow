@@ -3,6 +3,15 @@ import requests
 from pprint import pprint
 import polars as pl
 
+DEFAULT_USER_INITIAL_QUERY = "Analyze the dataset, find suitable targets, and recommend the best ML task."
+def resolve_user_initial_query(data_config):
+    if not isinstance(data_config, dict):
+        return DEFAULT_USER_INITIAL_QUERY
+    raw = data_config.get("user_initial_query")
+    if not isinstance(raw, str) or not raw.strip():
+        return DEFAULT_USER_INITIAL_QUERY
+    return raw.strip()
+
 def load_yaml_file(filepath: str):
     config = yaml.safe_load(open(filepath))
     data_config = config['data']
@@ -26,15 +35,14 @@ def load_yaml_file(filepath: str):
             df = pl.read_parquet("temp_data.parquet")
     else:
         raise ValueError(f"Unsupported source type: {data_config['source_type']}")
-    return df, schema
+    return df, schema, data_config
 
 def get_data_info(df):
     print("Columns: ", df.columns)
     print("\nColumn dtype: ", df.schema.values())
     return df.schema
     
-    
 # ------------------------------------------------------------------- #
 if __name__ == "__main__":
-    df, schema = load_yaml_file(filepath="data.yaml")
+    df, schema, _data_config = load_yaml_file(filepath="data.yaml")
     get_data_info(df)
